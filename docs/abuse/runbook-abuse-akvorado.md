@@ -231,17 +231,112 @@ LIMIT 50;
 
 **Si `TCPFlags` está habilitado** (columna deshabilitada por defecto en Akvorado):
 flujos con sólo SYN y sin respuesta son la confirmación definitiva de escaneo. Para
-activarla, añadir `TCPFlags` a `schema.enabled-columns` en la configuración — sólo
+activarla, añadirla a `schema.enabled` en la configuración del orquestador — sólo
 afecta a flujos futuros, no reconstruye el pasado.
 
-### 1.4 Si 38.3.130.200 es una IP de NAT/CGNAT
+### 1.4 Identificar al cliente detrás de un NAT/CGNAT
 
-Akvorado ve la IP pública post-NAT; el host real queda oculto. Para identificarlo hay
-que cruzar con los **logs de traducción NAT** del borde, usando el timestamp, la IP
-destino y el puerto de origen del reporte. Akvorado puede correlacionarlo por sí solo
-si el equipo exporta IPFIX con eventos NAT y se habilitan las columnas
-`SrcAddrNAT` / `SrcPortNAT` / `DstAddrNAT` / `DstPortNAT` en el esquema. Sin eso, la
-única fuente son los logs del CGNAT/firewall.
+La pregunta operativa real: si `38.3.130.200` es una IP de salida compartida, ¿puede
+Akvorado decirnos qué abonado estaba detrás en ese instante?
+
+**Depende de una sola cosa, comprobable de inmediato:**
+
+```sql
+SELECT name, type FROM system.columns
+WHERE table = 'flows' AND name LIKE '%NAT%';
+```
+
+**Si devuelve filas** → Akvorado puede desenmascarar al cliente directamente. Las
+columnas `SrcAddrNAT` / `SrcPortNAT` se rellenan desde los campos IPFIX
+`postNATSourceIPv4Address` / `postNAPTSourceTransportPort`, así que la semántica es:
+
+- `SrcAddr` / `SrcPort` → dirección y puerto **privados**, el abonado real
+- `SrcAddrNAT` / `SrcPortNAT` → dirección y puerto **públicos** tras la traducción
+
+La consulta de desenmascarado, buscando por la IP pública reportada:
+
+```sql
+SELECT
+    TimeReceived,
+    SrcAddr    AS abonado_privado,
+    SrcPort    AS puerto_privado,
+    SrcAddrNAT AS ip_publica,
+    SrcPortNAT AS puerto_publico,
+    DstAddr,
+    DstPort
+FROM flows
+WHERE TimeReceived BETWEEN toDateTime('2026-08-13 00:00:00', 'UTC')
+                       AND toDateTime('2026-08-14 00:00:00', 'UTC')
+  AND SrcAddrNAT = toIPv6('38.3.130.200')
+  -- AND SrcPortNAT = <puerto de origen del reporte>   <-- descomentar: identificación exacta
+  -- AND DstAddr   = toIPv6('<destino del reporte>')
+ORDER BY TimeReceived
+LIMIT 200;
+```
+
+Sin el `SrcPortNAT` del reporte, la consulta devuelve **todos** los abonados que
+compartían esa IP pública en la ventana — sirve para acotar, no para acusar.
+
+**Si no devuelve filas** → Akvorado no puede responder a esta pregunta para este
+incidente, y no hay forma de arreglarlo a posteriori. Las columnas NAT vienen
+**deshabilitadas por defecto**, sólo existen en la tabla cruda (`main-table-only`), y
+habilitarlas (añadir `SrcAddrNAT`, `SrcPortNAT`, `DstAddrNAT`, `DstPortNAT` a
+`schema.enabled`) afecta únicamente a flujos futuros. Además el CGNAT tiene que estar
+exportando IPFIX con esos campos: NetFlow v5/v9 clásico y sFlow no los llevan.
+
+En ese caso la única fuente es el **log de traducción del CGNAT/firewall**, y la clave
+de búsqueda es el cuarteto:
+
+> IP pública + **puerto de origen público** + timestamp exacto (con zona horaria) + destino
+
+**El puerto de origen es el dato imprescindible.** Sin él la identificación de un
+abonado tras CGNAT es imposible salvo que sólo uno hablara con ese destino en ese
+segundo. Y ese puerto normalmente **sí viene en el reporte de abuso** — es otra razón
+por la que abrir el portal es el paso bloqueante.
+
+Akvorado sigue aportando aquí aunque no tenga las columnas NAT: la tabla cruda guarda
+`SrcPort`, así que puede confirmar qué puertos públicos estuvieron activos hacia ese
+destino en la ventana, y con eso se acota la búsqueda en el log del CGNAT.
+
+### 1.4.1 Si la IP es una asignación estática, no NAT
+
+Entonces Akvorado puede identificar al cliente por sí solo, si el enriquecimiento está
+poblado. Dos vías, ambas consultables en la misma fila del flujo:
+
+```sql
+SELECT
+    SrcAddr,
+    SrcNetName, SrcNetRole, SrcNetSite, SrcNetTenant,
+    ExporterName, InIfName, InIfDescription,
+    count() AS flows
+FROM flows
+WHERE TimeReceived BETWEEN toDateTime('2026-08-13 00:00:00', 'UTC')
+                       AND toDateTime('2026-08-14 00:00:00', 'UTC')
+  AND SrcAddr = toIPv6('38.3.130.200')
+GROUP BY ALL;
+```
+
+- **`SrcNetName` / `SrcNetRole` / `SrcNetSite` / `SrcNetTenant`** — atributos que
+  Akvorado asigna por prefijo. Se definen estáticamente en `networks`, o se importan
+  con `network-sources`, que descarga un JSON por HTTP y lo transforma con una
+  expresión `jq`. **Esto es lo que más rentabiliza de cara al próximo reporte**: si se
+  conecta el IPAM a `network-sources`, cada flujo llega ya etiquetado con el cliente y
+  la identificación pasa de horas de correlación a una columna en la consulta.
+- **`InIfDescription`** — la descripción de la interfaz vía SNMP, habilitada por
+  defecto. En muchos operadores lleva el circuit ID o el nombre del cliente, así que a
+  menudo resuelve la pregunta sin configurar nada más.
+
+### 1.4.2 La limitación que ninguna columna arregla
+
+Para desenmascarar hace falta **el flujo concreto** del incidente, no una estimación
+agregada. Con un muestreo de 1:1000 o 1:10000, la probabilidad de haber capturado
+justo los paquetes del intento de acceso es baja. Las columnas NAT no cambian eso: si
+el flujo no se muestreó, no existe en la base.
+
+Conclusión práctica: para atribuir a un abonado tras CGNAT, **Akvorado es una fuente
+secundaria**. La primaria es el log de traducción del CGNAT, que registra todas las
+sesiones sin muestrear. Akvorado corrobora, acota la ventana y aporta contexto de
+patrón; el log del CGNAT es el que identifica.
 
 ### 1.5 Cruce con FastNetMon
 
@@ -387,7 +482,8 @@ Si el análisis concluye que **no** es nuestro:
 - [ ] Verificar en RDAP que 38.3.130.200 es nuestro
 - [ ] Comprobar que el evento cae dentro del TTL de la tabla `flows`
 - [ ] Ejecutar las consultas de §1.2 / §1.3 en la ventana correcta
-- [ ] Identificar exportador + interfaz + host real (o resolver el NAT)
+- [ ] Comprobar si existen las columnas NAT (`system.columns ... LIKE '%NAT%'`)
+- [ ] Identificar exportador + interfaz + host real (o resolver el NAT con el puerto de origen)
 - [ ] Revisar alertas de FastNetMon en esa ventana
 - [ ] Contener: aislar el host y/o aplicar ACL de salida
 - [ ] Preservar evidencia antes de reinstalar
